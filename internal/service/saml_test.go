@@ -366,13 +366,19 @@ func TestNewSAMLProvidersBuildsProductionMetadataPolicy(t *testing.T) {
 	if providers.metadataTransport.resolver == nil || providers.metadataTransport.dialer == nil {
 		t.Fatal("production constructor omitted guarded resolver or dialer")
 	}
-	client := publicMetadataHTTPClient(providers.metadataTransport)
+	client, err := publicMetadataHTTPClient(providers.metadataTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if client.Timeout != 15*time.Second {
 		t.Fatalf("metadata client timeout = %s, want 15s", client.Timeout)
 	}
 	guard, ok := client.Transport.(*publicMetadataRoundTripper)
 	if !ok {
 		t.Fatalf("metadata transport = %T, want *publicMetadataRoundTripper", client.Transport)
+	}
+	if guard.direct == nil {
+		t.Fatal("metadata direct transport omitted shared public-address dialer")
 	}
 	if guard.base.ResponseHeaderTimeout != 10*time.Second {
 		t.Fatalf("metadata response header timeout = %s, want 10s", guard.base.ResponseHeaderTimeout)
@@ -480,6 +486,48 @@ func TestSAMLMetadataTransportPinsPublicIPThroughConfiguredProxy(t *testing.T) {
 	}
 }
 
+func TestSAMLMetadataTransportUsesInjectedDialerForHTTPSProxy(t *testing.T) {
+	proxy := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(proxy.Close)
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(proxy.Certificate())
+
+	var attempted string
+	dialer := &net.Dialer{}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.Proxy = func(*http.Request) (*url.URL, error) { return proxyURL, nil }
+	base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		attempted = address
+		return dialer.DialContext(ctx, network, proxy.Listener.Addr().String())
+	}
+	base.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+
+	request, err := http.NewRequest(http.MethodGet, "https://idp.example/metadata", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := &publicMetadataRoundTripper{
+		base:     base,
+		resolver: staticMetadataResolver{netip.MustParseAddr("8.8.8.8")},
+	}
+	_, transport, err := guard.prepare(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := transport.DialTLSContext(request.Context(), "tcp", proxyURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection.Close()
+	if attempted != proxyURL.Host {
+		t.Fatalf("HTTPS proxy dial address = %q, want %q", attempted, proxyURL.Host)
+	}
+}
+
 func TestSAMLMetadataTransportRefusesPrivateResolutionBeforeProxy(t *testing.T) {
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	base.Proxy = func(*http.Request) (*url.URL, error) {
@@ -499,24 +547,26 @@ func TestSAMLMetadataTransportRefusesPrivateResolutionBeforeProxy(t *testing.T) 
 }
 
 func TestSAMLMetadataTransportFallsBackAcrossValidatedAddresses(t *testing.T) {
-	base := http.DefaultTransport.(*http.Transport).Clone()
-	base.Proxy = nil
 	var attempted []string
-	base.DialContext = func(_ context.Context, _, address string) (net.Conn, error) {
-		attempted = append(attempted, address)
-		return nil, errors.New("test address unreachable")
-	}
 	request, err := http.NewRequest(http.MethodGet, "https://idp.example/metadata", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	guard := &publicMetadataRoundTripper{
-		base: base,
+	client, err := publicMetadataHTTPClient(metadataTransportPrimitives{
 		resolver: staticMetadataResolver{
 			netip.MustParseAddr("8.8.8.8"),
 			netip.MustParseAddr("1.1.1.1"),
 		},
+		dialer: metadataDialFunc(func(_ context.Context, _, address string) (net.Conn, error) {
+			attempted = append(attempted, address)
+			return nil, errors.New("test address unreachable")
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	guard := client.Transport.(*publicMetadataRoundTripper)
+	guard.base.Proxy = nil
 	if _, err := guard.RoundTrip(request); err == nil {
 		t.Fatal("all unreachable addresses unexpectedly succeeded")
 	}

@@ -917,7 +917,10 @@ func (s *SAMLProviders) fetchMetadata(ctx context.Context, rawURL string) ([]byt
 	if err != nil || !metadataURLIsAllowed(target) {
 		return nil, ErrSAMLMetadataFetch
 	}
-	client := publicMetadataHTTPClient(s.metadataTransport)
+	client, err := publicMetadataHTTPClient(s.metadataTransport)
+	if err != nil {
+		return nil, ErrSAMLMetadataFetch
+	}
 	copyClient := *client
 	priorRedirect := copyClient.CheckRedirect
 	copyClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
@@ -977,13 +980,9 @@ func metadataIPIsNonPublic(address netip.Addr) bool {
 	return netpolicy.IsNonPublic(address)
 }
 
-type metadataDialer interface {
-	DialContext(context.Context, string, string) (net.Conn, error)
-}
-
 type metadataTransportPrimitives struct {
-	resolver metadataResolver
-	dialer   metadataDialer
+	resolver netpolicy.Resolver
+	dialer   netpolicy.Dialer
 	roots    *x509.CertPool
 	timeout  time.Duration
 }
@@ -996,7 +995,7 @@ func productionMetadataTransport() metadataTransportPrimitives {
 	}
 }
 
-func publicMetadataHTTPClient(primitives metadataTransportPrimitives) *http.Client {
+func publicMetadataHTTPClient(primitives metadataTransportPrimitives) (*http.Client, error) {
 	defaults := productionMetadataTransport()
 	if primitives.resolver == nil {
 		primitives.resolver = defaults.resolver
@@ -1007,35 +1006,53 @@ func publicMetadataHTTPClient(primitives metadataTransportPrimitives) *http.Clie
 	if primitives.timeout <= 0 {
 		primitives.timeout = defaults.timeout
 	}
+	direct, err := netpolicy.NewPublicDialer(nil, primitives.resolver, primitives.dialer)
+	if err != nil {
+		return nil, err
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = primitives.dialer.DialContext
 	transport.ResponseHeaderTimeout = 10 * time.Second
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: primitives.roots}
 	return &http.Client{
-		Transport: &publicMetadataRoundTripper{base: transport, resolver: primitives.resolver},
+		Transport: &publicMetadataRoundTripper{base: transport, resolver: primitives.resolver, direct: direct},
 		Timeout:   primitives.timeout,
-	}
+	}, nil
 }
 
-type metadataResolver interface {
-	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
-}
-
-// publicMetadataRoundTripper resolves and validates the destination before
-// handing it to net/http. The request then names the approved IP, preventing a
-// second DNS lookup from rebinding it. The original hostname remains in Host
-// and TLS ServerName, preserving HTTP routing and certificate verification.
+// publicMetadataRoundTripper sends direct requests through the shared public
+// dialer. Proxy requests retain the proxy-aware pinned-request path because an
+// opaque proxy changes the address visible to DialContext: the metadata target
+// must be validated before CONNECT and sent to the proxy as an approved IP.
 //
 // Proxy selection deliberately happens before the URL is pinned. HTTP,
 // HTTPS, and SOCKS proxies therefore keep working, but CONNECT receives the
 // already-approved IP rather than a hostname the proxy could resolve privately.
 type publicMetadataRoundTripper struct {
 	base     *http.Transport
-	resolver metadataResolver
+	resolver netpolicy.Resolver
+	direct   *netpolicy.PublicDialer
 }
 
 func (t *publicMetadataRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
-	addresses, proxyURL, err := t.destinations(request)
+	proxyURL, err := t.proxyURL(request)
+	if err != nil {
+		return nil, err
+	}
+	if proxyURL == nil {
+		if t.direct == nil {
+			return nil, errors.New("service: SAML metadata direct dialer is not configured")
+		}
+		transport := t.base.Clone()
+		transport.Proxy = nil
+		transport.DialContext = t.direct.DialContext
+		// Every redirect must resolve and recheck policy, even when its origin is
+		// unchanged. A fresh no-keepalive transport prevents connection reuse
+		// from bypassing that per-request check.
+		transport.DisableKeepAlives = true
+		return transport.RoundTrip(request)
+	}
+	addresses, err := t.resolveAddresses(request)
 	if err != nil {
 		return nil, err
 	}
@@ -1067,25 +1084,41 @@ func (t *publicMetadataRoundTripper) prepare(request *http.Request) (*http.Reque
 }
 
 func (t *publicMetadataRoundTripper) destinations(request *http.Request) ([]netip.Addr, *url.URL, error) {
+	addresses, err := t.resolveAddresses(request)
+	if err != nil {
+		return nil, nil, err
+	}
+	proxyURL, err := t.proxyURL(request)
+	if err != nil {
+		return nil, nil, err
+	}
+	return addresses, proxyURL, nil
+}
+
+func (t *publicMetadataRoundTripper) resolveAddresses(request *http.Request) ([]netip.Addr, error) {
 	host := request.URL.Hostname()
 	addresses, err := t.resolver.LookupNetIP(request.Context(), "ip", host)
 	if err != nil || len(addresses) == 0 {
-		return nil, nil, errors.New("service: SAML metadata host did not resolve")
+		return nil, errors.New("service: SAML metadata host did not resolve")
 	}
 	for _, resolved := range addresses {
 		if metadataIPIsNonPublic(resolved) {
-			return nil, nil, errors.New("service: SAML metadata host resolved to a non-public address")
+			return nil, errors.New("service: SAML metadata host resolved to a non-public address")
 		}
 	}
+	return addresses, nil
+}
 
+func (t *publicMetadataRoundTripper) proxyURL(request *http.Request) (*url.URL, error) {
 	var proxyURL *url.URL
+	var err error
 	if t.base.Proxy != nil {
 		proxyURL, err = t.base.Proxy(request)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
-	return addresses, proxyURL, nil
+	return proxyURL, nil
 }
 
 func (t *publicMetadataRoundTripper) prepareAddress(
@@ -1125,9 +1158,12 @@ func (t *publicMetadataRoundTripper) prepareAddress(
 	// session whose ServerName must remain the original metadata hostname.
 	if proxyURL != nil && proxyURL.Scheme == "https" {
 		proxyHost := proxyURL.Hostname()
-		dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+		dialContext := transport.DialContext
 		transport.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-			raw, err := dialer.DialContext(ctx, network, address)
+			if dialContext == nil {
+				return nil, errors.New("service: SAML metadata proxy dialer is not configured")
+			}
+			raw, err := dialContext(ctx, network, address)
 			if err != nil {
 				return nil, err
 			}
